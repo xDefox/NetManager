@@ -1,12 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-
 a = Analysis(
-    ['main.py'],
+    ['interface.py'],
     pathex=['.venv/Lib/site-packages'],
     binaries=[],
     datas=[],
-    hiddenimports=['scapy.all', 'scapy.layers.l2', 'scapy.layers.inet'],
+    hiddenimports=[
+        'scapy.all', 'scapy.layers.l2', 'scapy.layers.inet',
+        'scapy.layers.dns', 'scapy.layers.tls.all',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
