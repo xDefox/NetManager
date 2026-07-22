@@ -54,8 +54,7 @@ def console_main() -> None:
         for i, d in enumerate(tool.found_devices):
             print(f"{i:2} | {d['ip'].ljust(14)} | {d['mac']} | {d['name']}")
         print("-" * 55)
-        print("1. Сканировать | 2. Атака | 3. Мониторинг | 4. По шуму")
-        print("5. DHCP Spoof | 6. СТОП | 7. Выход")
+        print("1. Сканировать | 2. Атака | 3. Мониторинг | 4. По шуму | 5. СТОП | 6. Выход")
 
         cmd = input(">> ").strip()
         if cmd == "1":
@@ -85,15 +84,8 @@ def console_main() -> None:
                 print("Активных устройств не найдено.")
                 time.sleep(1)
         elif cmd == "5":
-            try:
-                idx = int(input("Введите ID для DHCP Spoof: "))
-                target = tool.found_devices[idx]
-                tool.start_dhcp_spoof(target["ip"], target["mac"])
-            except (ValueError, IndexError):
-                pass
-        elif cmd == "6":
             tool.stop()
-        elif cmd == "7":
+        elif cmd == "6":
             tool.stop()
             break
 

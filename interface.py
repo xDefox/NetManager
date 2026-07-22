@@ -180,10 +180,6 @@ async def main_ui(page: ft.Page) -> None:
             tool.attack(device["ip"], device["mac"])
             attack_status_view.value = f"● АТАКА: {device['ip']}"
             attack_status_view.color = "red"
-        elif mode == "dhcp":
-            tool.start_dhcp_spoof(device["ip"], device["mac"])
-            attack_status_view.value = f"● DHCP SPOOF: {device['ip']}"
-            attack_status_view.color = "purple"
         else:
             tool.start_monitor(device["ip"], device["mac"])
             attack_status_view.value = f"● МОНИТОРИНГ: {device['ip']}"
@@ -216,7 +212,6 @@ async def main_ui(page: ft.Page) -> None:
             ip = d["ip"]
             is_atk = state["ip"] == ip and state["mode"] == "attack"
             is_mon = state["ip"] == ip and state["mode"] == "monitor"
-            is_dhcp = state["ip"] == ip and state["mode"] == "dhcp"
 
             # Статус
             if is_atk:
@@ -225,9 +220,6 @@ async def main_ui(page: ft.Page) -> None:
             elif is_mon:
                 status_text_val = "ACTIVE"
                 status_color = "yellow"
-            elif is_dhcp:
-                status_text_val = "DHCP"
-                status_color = "purple"
             else:
                 status_text_val = "IDLE"
                 status_color = "grey"
@@ -241,17 +233,13 @@ async def main_ui(page: ft.Page) -> None:
                         ft.Icons.BLOCK,
                         icon_color="red" if is_atk else "grey700",
                         on_click=lambda e, d=d: handle_click(d, "attack"),
+                        tooltip="Атака (ARP + DHCP)",
                     ),
                     ft.IconButton(
                         ft.Icons.REMOVE_RED_EYE,
                         icon_color="yellow" if is_mon else "grey700",
                         on_click=lambda e, d=d: handle_click(d, "monitor"),
-                    ),
-                    ft.IconButton(
-                        ft.Icons.DNS,
-                        icon_color="purple" if is_dhcp else "grey700",
-                        on_click=lambda e, d=d: handle_click(d, "dhcp"),
-                        tooltip="DHCP Spoof",
+                        tooltip="Мониторинг",
                     ),
                 ])),
                 ft.DataCell(ft.Text(
